@@ -514,10 +514,10 @@ end
 -- struct __utimbuf32, _utime32
 -- struct __utimbuf64, _utime64
 --
--- Linux:
+-- Linux, OSX, POSIX:
 -- utime.h:
 -- struct utimbuf, utime
-local utimelib = require 'ffi.req' 'c.sys.utime'
+local utimelib = require 'ffi.req' 'c.utime'
 function _M.touch(path, actime, modtime)
 	local buf
 
