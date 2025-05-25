@@ -1,0 +1,16 @@
+--------------------------------------------
+-- generated with dist/build-distinfo.rua --
+--------------------------------------------
+
+name = "lfs_ffi"
+files = {
+	["LICENSE"] = "lfs_ffi/LICENSE",
+	["README.md"] = "lfs_ffi/README.md",
+	["lfs.lua"] = "lfs_ffi/lfs.lua",
+	["lfs_ffi.lua"] = "lfs_ffi/lfs_ffi.lua",
+}
+deps = {
+	"bit",
+	"ext",
+	"ffi",
+}
