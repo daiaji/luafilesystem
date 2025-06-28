@@ -10,7 +10,6 @@ files = {
 	["lfs_ffi.lua"] = "lfs_ffi/lfs_ffi.lua",
 }
 deps = {
-	"bit",
 	"ext",
 	"ffi",
 }
