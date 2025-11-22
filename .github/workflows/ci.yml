@@ -1,0 +1,111 @@
+name: LuaFileSystem CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  test-windows:
+    name: Test on Windows (LuaJIT)
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    env:
+      LUAJIT_BIN_DIR: ${{ github.workspace }}\.luajit_bin
+      LUAJIT_SRC_DIR: vendor/luajit/src
+
+    steps:
+      - name: Checkout LuaFileSystem
+        uses: actions/checkout@v4
+        with:
+          # [关键优化] 仅拉取顶层子模块，防止 A->B->A 的无限递归
+          submodules: 'true'
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # [关键优化] 缓存 LuaJIT 编译产物
+      # 只有当 vendor/luajit 子模块的 commit 发生变化时才会重新编译
+      - name: Cache LuaJIT Build
+        id: cache-luajit
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.LUAJIT_BIN_DIR }}
+          key: ${{ runner.os }}-luajit-${{ hashFiles('vendor/luajit/.git') }}
+          restore-keys: |
+            ${{ runner.os }}-luajit-
+
+      - name: Build LuaJIT
+        if: steps.cache-luajit.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          cd %LUAJIT_SRC_DIR%
+          call msvcbuild.bat gc64
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          mkdir "%LUAJIT_BIN_DIR%"
+          copy luajit.exe "%LUAJIT_BIN_DIR%\"
+          copy lua51.dll "%LUAJIT_BIN_DIR%\"
+          mkdir "%LUAJIT_BIN_DIR%\jit"
+          xcopy /s /y "jit\*.*" "%LUAJIT_BIN_DIR%\jit\"
+
+      - name: Add LuaJIT to PATH
+        shell: pwsh
+        run: echo "${{ env.LUAJIT_BIN_DIR }}" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # ========================================================================
+      # 准备依赖环境 (扁平化复制)
+      # ========================================================================
+      - name: Setup Dependencies
+        shell: pwsh
+        run: |
+          $envDir = "$PWD\.test_env"
+          if (Test-Path $envDir) { Remove-Item $envDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $envDir -Force | Out-Null
+
+          Write-Host "=== Setting up Environment ==="
+
+          # 1. lua-ffi-bindings
+          # 从当前仓库的 vendor 目录复制，但在复制时排除它内部的 vendor
+          $ffiSource = "vendor/lua-ffi-bindings"
+          $ffiDest = Join-Path $envDir "ffi"
+          Write-Host "Copying lua-ffi-bindings..."
+          # robocopy 是 Windows 最高效的复制命令
+          # /E: 递归, /XD vendor: 排除 vendor 目录, /NFL /NDL: 减少日志干扰
+          robocopy $ffiSource $ffiDest /E /XD vendor .git /NFL /NDL /NJH /NJS
+          if ($LASTEXITCODE -ge 8) { throw "Robocopy failed with exit code $LASTEXITCODE" }
+          # 重置 robocopy 退出码 (它 < 8 都是成功)
+          $LASTEXITCODE = 0
+
+          # 2. lua-ext
+          # lfs_ffi 依赖 ext.gc, ext.op 等
+          $extSource = "vendor/lua-ext"
+          $extDest = Join-Path $envDir "ext"
+          Write-Host "Copying lua-ext..."
+          robocopy $extSource $extDest /E /XD vendor .git /NFL /NDL /NJH /NJS
+          if ($LASTEXITCODE -ge 8) { throw "Robocopy failed with exit code $LASTEXITCODE" }
+          $LASTEXITCODE = 0
+
+          # 3. LuaUnit (直接下载单文件)
+          $luUrl = "https://raw.githubusercontent.com/bluebird75/luaunit/master/luaunit.lua"
+          Write-Host "Downloading luaunit.lua..."
+          Invoke-WebRequest -Uri $luUrl -OutFile (Join-Path $envDir "luaunit.lua")
+
+          # 4. Self (lfs_ffi.lua)
+          # 复制当前库的核心文件
+          Copy-Item "lfs_ffi.lua" $envDir
+
+      - name: Run Tests
+        shell: pwsh
+        run: |
+          $root = ($PWD.Path -replace "\\", "/")
+          
+          # 设置 LUA_PATH，使其优先查找 .test_env 下的库
+          # .test_env/?.lua 匹配 lfs_ffi.lua 和 luaunit.lua
+          # .test_env/?/init.lua 匹配 ext (lua-ext) 和 ffi (lua-ffi-bindings)
+          $env:LUA_PATH = "$root/.test_env/?.lua;$root/.test_env/?/init.lua;;"
+          
+          Write-Host "Running LFS Tests..."
+          luajit test_lfs.lua -v

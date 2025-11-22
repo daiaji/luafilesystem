@@ -16,6 +16,12 @@ local _M = {
 	_VERSION = "0.1",
 }
 
+-- [Fix] Helper to unwrap FILE* from custom file handle tables (created by _M.fopen)
+local function to_fp(fh)
+	if type(fh) == 'table' and fh.fp then return fh.fp end
+	return fh
+end
+
 -- Linux:
 -- sys/types.h has ssize_t
 -- in Windows it's missing, so I wedged it in
@@ -73,6 +79,7 @@ end
 -- misc
 -- Windows-only:
 local wchar_t, win_utf8_to_wchar, win_wchar_to_utf8
+local iolib -- [Fix] Hoisted iolib to file scope so lstat_func can use it later
 if ffi.os == "Windows" then
 	-- in Windows:
 	-- wchar.h -> corecrt_wio.h
@@ -82,75 +89,21 @@ if ffi.os == "Windows" then
 	-- corecrt_io.h
 	-- _findfirst, _findnext, _finddata_t, _finddata_i64_t
 	-- _setmode, _locking
-	local iolib = require 'ffi.req' 'c.io'
+	iolib = require 'ffi.req' 'c.io'
+
+	-- Win32 SDK definitions (Kernel32)
+	require 'ffi.req' 'Windows.sdk.kernel32'
+	
+	-- Need corecrt_wstdio for FILE definition and _wfopen
+	require 'ffi.req' 'c.corecrt_wstdio'
 
 	function wchar_t(s)
-		local mbstate = ffi.new('mbstate_t[1]')
-		local wcs = ffi.new('wchar_t[?]', #s + 1)
-		local i = 0
-		local offset = 0
-		local len = #s
-		while true do
-			local processed = wiolib.mbrtowc(
-				wcs + i, ffi.cast('const char *', s) + offset, len, mbstate)
-			if processed <= 0 then break end
-			i = i + 1
-			offset = offset + processed
-			len = len - processed
-		end
-		return wcs
+		-- We use win_utf8_to_wchar (defined below) which uses CP_UTF8
+		-- This ensures lock/link operations support UTF-8 paths properly
+		-- Also ensure we only return the pointer (arg 1), discarding the length
+		return (win_utf8_to_wchar(s))
 	end
 
-	ffi.cdef[[
-// https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types
-// ... says LPTSTR is in WinNT.h
-typedef wchar_t* LPTSTR;
-// ... says BOOLEAN is in WinNT.h
-typedef unsigned char BOOLEAN;
-// ... says DWORD is in IntSafe.h
-typedef unsigned long DWORD;
-
-// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createsymboliclinkw says it is in WinBase.h
-BOOLEAN CreateSymbolicLinkW(
-	LPTSTR lpSymlinkFileName,
-	LPTSTR lpTargetFileName,
-	DWORD dwFlags
-);
-
-// https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-widechartomultibyte says it is in stringapiset.h
-int WideCharToMultiByte(
-	unsigned int	 CodePage,
-	DWORD	dwFlags,
-	const wchar_t*  lpWideCharStr,
-	int	  cchWideChar,
-	char*	lpMultiByteStr,
-	int	  cbMultiByte,
-	const char*   lpDefaultChar,
-	int*   lpUsedDefaultChar);
-
-// https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-multibytetowidechar says it is in stringapiset.h
-int MultiByteToWideChar(
-	unsigned int	 CodePage,
-	DWORD	dwFlags,
-	const char*   lpMultiByteStr,
-	int	  cbMultiByte,
-	wchar_t*   lpWideCharStr,
-	int	  cchWideChar);
-
-// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-getlasterror says it is in errhandlingapi.h
-uint32_t GetLastError();
-
-// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-formatmessagea says it is in winbase.h
-uint32_t FormatMessageA(
-	uint32_t dwFlags,
-	const void* lpSource,
-	uint32_t dwMessageId,
-	uint32_t dwLanguageId,
-	char* lpBuffer,
-	uint32_t nSize,
-	va_list *Arguments
-);
-]]
 	-- Some helper functions
 
 	-- returns the Windows error message for the specified error
@@ -220,7 +173,11 @@ uint32_t FormatMessageA(
 			error('setmode: invalid mode')
 		end
 		mode = (mode == 'text') and 0x4000 or 0x8000
-		local prev_mode = iolib._setmode(stdiolib.fileno(file), mode)
+		-- [Fix] Add check for closed file
+		local fp = to_fp(file)
+		if not fp then return nil, "setmode: closed file" end
+		
+		local prev_mode = iolib._setmode(stdiolib.fileno(fp), mode)
 		if prev_mode == -1 then
 			return nil, errnolib.str()
 		end
@@ -231,12 +188,21 @@ uint32_t FormatMessageA(
 		return _M.attributes(path, 'mode') == 'directory' and 1 or 0
 	end
 
-	function _M.link(old, new)
-		local is_dir = check_is_dir(old)
-		if lib.CreateSymbolicLinkW(
-				wchar_t(new),
-				wchar_t(old), is_dir) ~= 0 then
-			return true
+	function _M.link(old, new, symlink)
+		if symlink then
+			local is_dir = check_is_dir(old)
+			if lib.CreateSymbolicLinkW(
+					wchar_t(new),
+					wchar_t(old), is_dir) ~= 0 then
+				return true
+			end
+		else
+			-- Hard Link
+			if lib.CreateHardLinkW(
+					wchar_t(new),
+					wchar_t(old), nil) ~= 0 then
+				return true
+			end
 		end
 		return nil, errnolib.str()
 	end
@@ -369,6 +335,9 @@ uint32_t FormatMessageA(
 	}
 
 	local function lock(fh, mode, start, len)
+		-- [Fix] Add check for closed file to prevent NULL pointer dereference in C
+		if fh == nil then return nil, "lock: closed file" end
+		
 		local lkmode = mode_ltype_map[mode]
 		if not len or len <= 0 then
 			if stdiolib.fseek(fh, 0, stdiolib.SEEK_END) ~= 0 then
@@ -396,7 +365,7 @@ uint32_t FormatMessageA(
 		if io.type(filehandle) ~= 'file' then
 			error("lock: invalid file")
 		end
-		local ok, err = lock(filehandle, mode, start, length)
+		local ok, err = lock(to_fp(filehandle), mode, start, length)
 		if not ok then
 			return nil, err
 		end
@@ -407,7 +376,7 @@ uint32_t FormatMessageA(
 		if io.type(filehandle) ~= 'file' then
 			error("unlock: invalid file")
 		end
-		local ok, err = lock(filehandle, 'u', start, length)
+		local ok, err = lock(to_fp(filehandle), 'u', start, length)
 		if not ok then
 			return nil, err
 		end
@@ -466,6 +435,9 @@ else
 	}
 
 	local function lock(fd, mode, start, len)
+		-- [Fix] Add check for closed file
+		if fd == -1 or fd == nil then return nil, "lock: closed file" end
+		
 		local flock = ffi.new'struct flock'
 		flock.l_type = mode_ltype_map[mode]
 		flock.l_whence = stdiolib.SEEK_SET
@@ -484,7 +456,10 @@ else
 		if io.type(filehandle) ~= 'file' then
 			error("lock: invalid file")
 		end
-		local fd = stdiolib.fileno(filehandle)
+		local fp = to_fp(filehandle)
+		if not fp then return nil, "lock: closed file" end
+		
+		local fd = stdiolib.fileno(fp)
 		local ok, err = lock(fd, mode, start, length)
 		if not ok then
 			return nil, err
@@ -496,7 +471,10 @@ else
 		if io.type(filehandle) ~= 'file' then
 			error("unlock: invalid file")
 		end
-		local fd = stdiolib.fileno(filehandle)
+		local fp = to_fp(filehandle)
+		if not fp then return nil, "unlock: closed file" end
+		
+		local fd = stdiolib.fileno(fp)
 		local ok, err = lock(fd, 'u', start, length)
 		if not ok then
 			return nil, err
@@ -526,11 +504,26 @@ function _M.touch(path, actime, modtime)
 		buf.modtime = modtime
 	end
 
-	local p = ffi.new("unsigned char[?]", #path + 1)
-	ffi.copy(p, path)
+	if ffi.os == 'Windows' and _M.use_wchar then
+		-- Windows Unicode 路径处理
+		local wpath = assert(win_utf8_to_wchar(path))
+		
+		-- 根据架构选择对应的宽字符函数 (在 sys/utime.lua 中定义)
+		local res
+		if ffi.arch == 'x64' then
+			res = utimelib._wutime64(wpath, buf)
+		else
+			res = utimelib._wutime32(wpath, buf)
+		end
+		
+		if res == 0 then return true end
+	else
+		local p = ffi.new("unsigned char[?]", #path + 1)
+		ffi.copy(p, path)
 
-	if utimelib.utime(p, buf) == 0 then
-		return true
+		if utimelib.utime(p, buf) == 0 then
+			return true
+		end
 	end
 	return nil, errnolib.str()
 end
@@ -604,30 +597,6 @@ local create_lockfile
 local delete_lockfile
 
 if ffi.os == 'Windows' then
-	ffi.cdef[[
-typedef const wchar_t* LPCWSTR;
-typedef struct _SECURITY_ATTRIBUTES {
-	DWORD nLength;
-	void *lpSecurityDescriptor;
-	int bInheritHandle;
-} SECURITY_ATTRIBUTES;
-typedef SECURITY_ATTRIBUTES *LPSECURITY_ATTRIBUTES;
-
-// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew says it's in fileapi.h
-void *CreateFileW(
-	LPCWSTR lpFileName,
-	DWORD dwDesiredAccess,
-	DWORD dwShareMode,
-	LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-	DWORD dwCreationDisposition,
-	DWORD dwFlagsAndAttributes,
-	void *hTemplateFile
-);
-
-// https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-closehandle says it's in handleapi.h
-int CloseHandle(void *hObject);
-	]]
-
 	local GENERIC_WRITE = 0x40000000
 	local CREATE_NEW = 1
 	local FILE_NORMAL_DELETE_ON_CLOSE = 0x04000080
@@ -694,9 +663,48 @@ local function stat_func(filepath, buf)
 	end
 end
 
+-- [Fix] Implement real lstat for Windows to support symlinks
 local lstat_func
 if ffi.os == 'Windows' then
-	lstat_func = stat_func
+    lstat_func = function(filepath, buf)
+        -- _wstat64 follows symlinks (stat). We need something that doesn't (lstat).
+        -- We use _wfindfirst64 to check attributes of the link itself.
+        local fd_data = ffi.new('struct _wfinddata64_t')
+        local handle = iolib._wfindfirst64(assert(win_utf8_to_wchar(filepath)), fd_data)
+        if handle == -1 then return -1 end
+        iolib._findclose(handle)
+        
+        -- Map _wfinddata64_t to struct stat
+        local FILE_ATTRIBUTE_DIRECTORY = 0x10
+        local FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+        local attrib = fd_data.attrib
+        
+        local mode = 0
+        if bit.band(attrib, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0 then
+            mode = 0xA000 -- S_IFLNK (Posix constant, not in MSVC headers)
+        elseif bit.band(attrib, FILE_ATTRIBUTE_DIRECTORY) ~= 0 then
+            mode = lib.S_IFDIR
+        else
+            mode = lib.S_IFREG
+        end
+        
+        -- Default permissions 0777 (Windows permissions are limited anyway)
+        buf.st_mode = bit.bor(mode, 0x1FF) 
+        
+        buf.st_size = fd_data.size
+        buf.st_mtime = fd_data.time_write
+        buf.st_atime = fd_data.time_access
+        buf.st_ctime = fd_data.time_create
+        
+        buf.st_dev = 0
+        buf.st_ino = 0
+        buf.st_nlink = 1 
+        buf.st_uid = 0
+        buf.st_gid = 0
+        buf.st_rdev = 0
+        
+        return 0
+    end
 else	-- Linux, OSX, BSD, etc
 	lstat_func = statlib.lstat
 end
@@ -717,6 +725,11 @@ for k,name in pairs{
 	if v then
 		ftype_name_map[v] = name
 	end
+end
+
+-- [Fix] Ensure S_IFLNK is mapped for Windows (0xA000)
+if ffi.os == 'Windows' then
+    ftype_name_map[0xA000] = 'link'
 end
 
 local function mode_to_ftype(mode)
@@ -862,5 +875,249 @@ _M.use_wchar = true
 _M.wchar_errors = false
 --this would error with _M.wchar_errors = true
 --local cad = string.char(0xE0,0x80,0x80)--,0xFD,0xFF)
+
+local C = ffi.C
+
+-- FileHandle metatable to mimic Lua's file object
+local FileHandle = {}
+FileHandle.__index = FileHandle
+
+function FileHandle:close()
+	if self.fp then
+		C.fclose(self.fp)
+		self.fp = nil
+		return true
+	end
+	return nil, "file already closed"
+end
+
+function FileHandle:flush()
+	if self.fp then C.fflush(self.fp) end
+	return true
+end
+
+function FileHandle:write(...)
+	if not self.fp then return nil, "closed file" end
+	local args = {...}
+	for i, v in ipairs(args) do
+		local data = tostring(v)
+		if #data > 0 then
+			local res = C.fwrite(data, 1, #data, self.fp)
+			if res ~= #data then return nil, "write error" end
+		end
+	end
+	return true
+end
+
+function FileHandle:seek(whence, offset)
+	if not self.fp then return nil, "closed file" end
+	offset = offset or 0
+	local origin = 0 -- SEEK_SET
+	if whence == "cur" then origin = 1 end
+	if whence == "end" then origin = 2 end
+
+	if C.fseek(self.fp, offset, origin) == 0 then
+		return tonumber(C.ftell(self.fp))
+	end
+	return nil, "seek failed"
+end
+
+function FileHandle:setvbuf(mode, size)
+	if not self.fp then return nil, "closed file" end
+	
+	local imode = stdiolib._IOFBF -- default full buffering
+	if mode == "no" then imode = stdiolib._IONBF
+	elseif mode == "line" then imode = stdiolib._IOLBF
+	end
+	
+	size = size or 1024 -- standard default
+	
+	if stdiolib.setvbuf(self.fp, nil, imode, size) ~= 0 then
+		return nil, "setvbuf failed"
+	end
+	return true
+end
+
+function FileHandle:__tostring()
+	if self.fp then
+		return string.format("file (%p)", self.fp)
+	else
+		return "file (closed)"
+	end
+end
+
+-- Internal helpers for read()
+local function read_bytes(fp, n)
+	if n == 0 then 
+		-- Check for EOF without consuming input
+		local c = stdiolib.fgetc(fp)
+		if c == -1 then -- EOF
+			return nil 
+		end
+		stdiolib.ungetc(c, fp)
+		return "" 
+	end
+	local buf = ffi.new("uint8_t[?]", n)
+	local read_len = C.fread(buf, 1, n, fp)
+	if read_len == 0 then return nil end
+	return ffi.string(buf, read_len)
+end
+
+local function read_all(fp)
+	local cur = C.ftell(fp)
+	C.fseek(fp, 0, 2) -- SEEK_END
+	local size = C.ftell(fp) - cur
+	C.fseek(fp, cur, 0) -- SEEK_SET
+
+	if size <= 0 then
+		if C.feof(fp) ~= 0 then return "" end
+		-- fallback for non-seekable streams: read in chunks
+		local chunk_size = 4096
+		local chunks = {}
+		local total = 0
+		while true do
+			local buf = ffi.new("uint8_t[?]", chunk_size)
+			local read_len = C.fread(buf, 1, chunk_size, fp)
+			if read_len > 0 then
+				table.insert(chunks, ffi.string(buf, read_len))
+				total = total + read_len
+			else
+				break
+			end
+		end
+		if total == 0 then return "" end
+		return table.concat(chunks)
+	end
+
+	local buf = ffi.new("uint8_t[?]", size)
+	local read_len = C.fread(buf, 1, size, fp)
+	return ffi.string(buf, read_len)
+end
+
+local function read_line(fp, keep_eol)
+	local chunk_size = 1024
+	local buf = ffi.new("char[?]", chunk_size)
+	local parts = {}
+
+	while true do
+		if C.fgets(buf, chunk_size, fp) == nil then
+			if #parts == 0 then return nil end
+			break
+		end
+
+		local str = ffi.string(buf)
+		table.insert(parts, str)
+
+		local last_char = string.sub(str, -1)
+		if last_char == "\n" then
+			break
+		end
+	end
+
+	local line = table.concat(parts)
+	if not keep_eol then
+		if string.sub(line, -1) == "\n" then
+			line = string.sub(line, 1, -2)
+			if string.sub(line, -1) == "\r" then
+				line = string.sub(line, 1, -2)
+			end
+		end
+	end
+	return line
+end
+
+local function read_number(fp)
+	local d = ffi.new("double[1]")
+	-- fscanf handles whitespace skipping for numbers
+	local res = stdiolib.fscanf(fp, "%lf", d)
+	if res == 1 then
+		return tonumber(d[0])
+	end
+	return nil
+end
+
+function FileHandle:read(...)
+	if not self.fp then return nil, "closed file" end
+
+	local args = {...}
+	if #args == 0 then args = {"*l"} end
+
+	local results = {}
+	for i, fmt in ipairs(args) do
+		local val
+		if type(fmt) == "number" then
+			val = read_bytes(self.fp, fmt)
+		elseif fmt == "*a" then
+			val = read_all(self.fp)
+		elseif fmt == "*l" then
+			val = read_line(self.fp, false)
+		elseif fmt == "*L" then
+			val = read_line(self.fp, true)
+		elseif fmt == "*n" then
+			val = read_number(self.fp)
+		else
+			return nil, "invalid format"
+		end
+
+		-- Standard Lua file:read returns nil on EOF for *l/*n, but "" for *a
+		if val == nil then
+			if fmt == "*a" then val = "" end 
+		end
+		table.insert(results, val)
+		
+		-- If any read returns nil (EOF), standard Lua behavior varies depending on version,
+		-- but typically for multiple args, it continues or stops. 
+		-- Here we stick to simple accumulation.
+	end
+	
+	local unpack = table.unpack or unpack
+	return unpack(results)
+end
+
+function FileHandle:lines(fmt)
+	return function()
+		return self:read(fmt or "*l")
+	end
+end
+
+function FileHandle:__gc()
+	self:close()
+end
+
+-- Expose OS-aware IO functions
+function _M.fopen(path, mode)
+	mode = mode or "r"
+	local fp
+	if ffi.os == "Windows" then
+		local wpath = _M.win_utf8_to_wchar(path)
+		local wmode = _M.win_utf8_to_wchar(mode)
+		fp = C._wfopen(wpath, wmode)
+	else
+		fp = C.fopen(path, mode)
+	end
+
+	if fp == nil then return nil, "No such file or directory: " .. tostring(path) end
+	return setmetatable({ fp = fp }, FileHandle)
+end
+
+-- Replacement for os.remove (supports unicode on windows)
+function _M.remove_file(path)
+	if ffi.os == "Windows" then
+		return C._wremove((_M.win_utf8_to_wchar(path))) == 0
+	else
+		return os.remove(path)
+	end
+end
+
+-- Replacement for os.rename (supports unicode on windows)
+function _M.rename_file(old, new)
+	if ffi.os == "Windows" then
+		return C._wrename((_M.win_utf8_to_wchar(old)), (_M.win_utf8_to_wchar(new))) == 0
+	else
+		return os.rename(old, new)
+	end
+end
+
+_M.FileHandle = FileHandle
 
 return _M
