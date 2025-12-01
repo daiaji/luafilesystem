@@ -1026,14 +1026,45 @@ local function read_line(fp, keep_eol)
 	return line
 end
 
+-- [FIX] Safe manual implementation of *n (number parsing) without using fscanf
+-- This prevents crashes on Windows when using FFI/UCRT with mismatched signatures
 local function read_number(fp)
-	local d = ffi.new("double[1]")
-	-- fscanf handles whitespace skipping for numbers
-	local res = stdiolib.fscanf(fp, "%lf", d)
-	if res == 1 then
-		return tonumber(d[0])
+	local c
+	-- 1. Skip leading whitespace
+	while true do
+		c = stdiolib.fgetc(fp)
+		if c == -1 then return nil end
+		-- Check for whitespace (space, tab, newline, cr, vt, ff)
+		if not string.char(c):match("%s") then break end
 	end
-	return nil
+	
+	-- 2. Check if the first character is valid for a number start
+	local s = string.char(c)
+	if not s:match("[%d%.%-%+]") then
+		-- Not a number, push back
+		stdiolib.ungetc(c, fp)
+		return nil
+	end
+	
+	-- 3. Read valid number characters
+	local buf = {s}
+	while true do
+		c = stdiolib.fgetc(fp)
+		if c == -1 then break end
+		s = string.char(c)
+		-- Heuristic: consume characters that typically make up numbers
+		-- digits, dot, signs, exponents (e/E)
+		if s:match("[%d%.%-%+eE]") then
+			table.insert(buf, s)
+		else
+			-- Not part of number, push back
+			stdiolib.ungetc(c, fp)
+			break
+		end
+	end
+	
+	-- 4. Convert to number
+	return tonumber(table.concat(buf))
 end
 
 function FileHandle:read(...)
